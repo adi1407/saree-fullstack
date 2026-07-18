@@ -1,0 +1,39 @@
+# Project-wide ignores for the shop monorepo (frontend + backend).
+# Per-package .gitignore files add framework-specific rules.
+
+# dependencies
+node_modules/
+**/node_modules/
+
+# env files (keep examples committed)
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# build output
+dist/
+build/
+**/.next/
+**/out/
+*.tsbuildinfo
+
+# user-generated uploads
+**/uploads/
+
+# logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# coverage / test output
+coverage/
+.nyc_output/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
