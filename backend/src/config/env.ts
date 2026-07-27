@@ -23,6 +23,15 @@ const envSchema = z
     MESSAGE_CENTRAL_AUTH_TOKEN: z.string().optional(),
     MESSAGE_CENTRAL_CUSTOMER_ID: z.string().optional(),
     MESSAGE_CENTRAL_SENDER_ID: z.string().optional(),
+    /** When false, chat API returns 503. Defaults true so mock mode works without a key. */
+    CHAT_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+    LLM_API_KEY: z.string().optional(),
+    LLM_BASE_URL: z.string().default("https://api.openai.com/v1"),
+    LLM_MODEL: z.string().default("gpt-4o-mini"),
+    LLM_EMBEDDING_MODEL: z.string().default("text-embedding-3-small"),
   })
   // Production must not run with dev defaults or mock payments — those would
   // allow forgeable tokens and orders marked "paid" without real payment.

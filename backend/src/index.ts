@@ -14,9 +14,11 @@ import uploadRoutes from "./routes/upload.routes";
 import checkoutRoutes from "./routes/checkout.routes";
 import orderRoutes from "./routes/order.routes";
 import webhookRoutes from "./routes/webhook.routes";
+import chatRoutes from "./routes/chat.routes";
 import { RAZORPAY_MOCK } from "./services/razorpay.service";
 import { SHIPROCKET_MOCK } from "./services/shiprocket.service";
 import { MSG_CENTRAL_MOCK } from "./services/otp.service";
+import { hasLlmKey } from "./services/chat/llm";
 
 const app = express();
 
@@ -68,6 +70,7 @@ app.use("/api/cart", cartRoutes);
 app.use("/api/checkout", checkoutRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/webhooks", webhookRoutes);
+app.use("/api/chat", chatRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/admin/upload", uploadRoutes);
 
@@ -84,6 +87,13 @@ async function start() {
   }
   if (MSG_CENTRAL_MOCK) {
     console.log("[MessageCentral] MOCK MODE — OTP codes are logged to console; set MESSAGE_CENTRAL_AUTH_TOKEN to enable real SMS");
+  }
+  if (!env.CHAT_ENABLED) {
+    console.log("[Chat] DISABLED — set CHAT_ENABLED=true to enable the assistant");
+  } else if (!hasLlmKey()) {
+    console.log("[Chat] MOCK MODE — set LLM_API_KEY for LLM tool-calling; keyword intents still hit live catalog/RAG");
+  } else {
+    console.log(`[Chat] LLM ready — model ${env.LLM_MODEL} via ${env.LLM_BASE_URL}`);
   }
 
   app.listen(env.PORT, () => {

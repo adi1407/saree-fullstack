@@ -2,61 +2,11 @@ import { Request, Response } from "express";
 import { Saree } from "../models/Saree";
 import { asyncHandler } from "../utils/asyncHandler";
 import { AppError } from "../middleware/error.middleware";
-
-type CatalogQuery = {
-  weave?: string;
-  occasion?: string;
-  minPrice?: string;
-  maxPrice?: string;
-  color?: string;
-  fabric?: string;
-  search?: string;
-  newArrival?: string;
-  inStock?: string;
-  blouseIncluded?: string;
-};
-
-function buildCatalogFilter(
-  query: CatalogQuery,
-  exclude?: "weave" | "occasion" | "color" | "fabric" | "price"
-): Record<string, unknown> {
-  const filter: Record<string, unknown> = { isPublished: true };
-
-  if (query.weave && exclude !== "weave") filter.weave = query.weave;
-  if (query.occasion && exclude !== "occasion") filter.occasion = query.occasion;
-  if (query.color && exclude !== "color") {
-    filter["colors.primary"] = new RegExp(String(query.color), "i");
-  }
-  if (query.fabric && exclude !== "fabric") filter.fabric = query.fabric;
-  if (exclude !== "price" && (query.minPrice || query.maxPrice)) {
-    filter.price = {};
-    if (query.minPrice) (filter.price as Record<string, number>).$gte = Number(query.minPrice);
-    if (query.maxPrice) (filter.price as Record<string, number>).$lte = Number(query.maxPrice);
-  }
-  if (query.newArrival === "true") filter.isNewArrival = true;
-  if (query.inStock === "true") filter.inventory = { $gt: 0 };
-  if (query.blouseIncluded === "true") filter.blouseIncluded = true;
-  if (query.search) {
-    filter.$text = { $search: String(query.search) };
-  }
-
-  return filter;
-}
-
-function buildSearchMatch(
-  query: CatalogQuery,
-  exclude?: "weave" | "occasion" | "color" | "fabric" | "price"
-): Record<string, unknown> {
-  const filter = buildCatalogFilter({ ...query, search: undefined }, exclude);
-  if (query.search) {
-    const term = String(query.search).trim();
-    if (term) {
-      const regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
-      filter.$or = [{ name: regex }, { description: regex }];
-    }
-  }
-  return filter;
-}
+import {
+  CatalogQuery,
+  buildCatalogFilter,
+  buildSearchMatch,
+} from "../services/catalogQuery";
 
 const sortMap: Record<string, Record<string, 1 | -1>> = {
   featured: { isNewArrival: -1, createdAt: -1 },
@@ -156,23 +106,39 @@ export const getFacets = asyncHandler(async (req: Request, res: Response) => {
 
   const [weaves, occasions, colors, fabrics, priceStats] = await Promise.all([
     Saree.aggregate([
-      { $match: catalogQuery.search ? buildSearchMatch(catalogQuery, "weave") : buildCatalogFilter(catalogQuery, "weave") },
+      {
+        $match: catalogQuery.search
+          ? buildSearchMatch(catalogQuery, "weave")
+          : buildCatalogFilter(catalogQuery, "weave"),
+      },
       { $group: { _id: "$weave", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]),
     Saree.aggregate([
-      { $match: catalogQuery.search ? buildSearchMatch(catalogQuery, "occasion") : buildCatalogFilter(catalogQuery, "occasion") },
+      {
+        $match: catalogQuery.search
+          ? buildSearchMatch(catalogQuery, "occasion")
+          : buildCatalogFilter(catalogQuery, "occasion"),
+      },
       { $unwind: "$occasion" },
       { $group: { _id: "$occasion", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]),
     Saree.aggregate([
-      { $match: catalogQuery.search ? buildSearchMatch(catalogQuery, "color") : buildCatalogFilter(catalogQuery, "color") },
+      {
+        $match: catalogQuery.search
+          ? buildSearchMatch(catalogQuery, "color")
+          : buildCatalogFilter(catalogQuery, "color"),
+      },
       { $group: { _id: "$colors.primary", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]),
     Saree.aggregate([
-      { $match: catalogQuery.search ? buildSearchMatch(catalogQuery, "fabric") : buildCatalogFilter(catalogQuery, "fabric") },
+      {
+        $match: catalogQuery.search
+          ? buildSearchMatch(catalogQuery, "fabric")
+          : buildCatalogFilter(catalogQuery, "fabric"),
+      },
       { $group: { _id: "$fabric", count: { $sum: 1 } } },
       { $sort: { count: -1 } },
     ]),
