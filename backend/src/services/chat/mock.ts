@@ -1,11 +1,13 @@
 import { executeTool, type ToolContext } from "./tools";
 import type { ProductCardPayload } from "../catalogQuery";
 import { detectHandoff } from "./validator";
+import { classifyIntent, type DetectedLanguage } from "./intent";
 
 export type MockChatResult = {
   reply: string;
   products: ProductCardPayload[];
   handoff: boolean;
+  needsSignIn?: boolean;
 };
 
 const WEAVES = ["banarasi", "kanjeevaram", "chanderi", "maheshwari", "bandhani", "patola"] as const;
@@ -52,56 +54,132 @@ function extractColor(message: string): string | undefined {
   return colors.find((c) => lower.includes(c));
 }
 
-function wantsOrder(message: string): boolean {
-  return /\b(order|track|shipping status|delivery status)\b/i.test(message);
+function greet(name?: string, language: DetectedLanguage = "en"): string {
+  if (name) {
+    return language === "hi" ? `${name} ji, ` : `${name}, `;
+  }
+  return "";
 }
 
-function wantsKnowledge(message: string): boolean {
-  return /\b(return|refund|exchange|ship|delivery|care|wash|iron|faq|payment|cod|blouse|length|contact|policy)\b/i.test(
-    message
-  );
-}
-
-function wantsHandoff(message: string): boolean {
-  return /\b(human|stylist|consultant|appointment|whatsapp|speak to|talk to)\b/i.test(message);
+function formatOrderLine(o: {
+  orderNumber: string;
+  status: string;
+  total: number;
+}): string {
+  return `• **${o.orderNumber}** — ${o.status.replace(/_/g, " ")} — ₹${Number(o.total).toLocaleString("en-IN")}`;
 }
 
 /**
  * Deterministic tool-only path when LLM_API_KEY is missing.
  * Intent → tools → template reply (no invented catalog facts).
  */
-export async function runMockChat(message: string, ctx: ToolContext): Promise<MockChatResult> {
-  if (wantsHandoff(message)) {
+export async function runMockChat(
+  message: string,
+  ctx: ToolContext
+): Promise<MockChatResult> {
+  const { intent, language, knowledgeQuery, orderIdOrNumber } = classifyIntent(message);
+  const prefix = greet(ctx.displayName, language);
+
+  if (intent === "handoff") {
     return {
       reply:
-        "I can connect you with an AADIORA stylist. Email care@aadiora.com or book an appointment at /appointments — we typically respond within 24 hours.",
+        language === "hi"
+          ? `${prefix}Main aapko AADIORA stylist se connect kar sakti hoon. care@aadiora.com par likhein ya /appointments par booking karein — hum 24 hours mein jawab dete hain.`
+          : `${prefix}I can connect you with an AADIORA stylist. Email care@aadiora.com or book at /appointments — we typically respond within 24 hours.`,
       products: [],
       handoff: true,
     };
   }
 
-  if (wantsOrder(message)) {
-    const orderMatch = message.match(/\b(ORD[-_]?\w+|[a-f\d]{24})\b/i);
-    if (!orderMatch) {
+  if (intent === "account_identity") {
+    const result = await executeTool("get_my_profile", "{}", ctx);
+    if (!result.ok) {
+      const data = result.data as { message?: string };
       return {
         reply:
-          "I can check an order if you are signed in. Share your order number (for example ORD-…), or open Account → Orders.",
+          language === "hi"
+            ? `${prefix}Abhi aap guest hain. Sign in karein (/login) taaki main aapka naam jaan sakoon.`
+            : `${prefix}${data.message ?? "Please sign in so I can greet you by name."}`,
+        products: [],
+        handoff: false,
+        needsSignIn: true,
+      };
+    }
+    const profile = result.data as { name: string };
+    return {
+      reply:
+        language === "hi"
+          ? `Haan — aapka naam **${profile.name}** hai. Main aapki madad ke liye yahan hoon.`
+          : `Yes — you're **${profile.name}**. How can I help you today?`,
+      products: [],
+      handoff: false,
+    };
+  }
+
+  if (intent === "order_list" || (intent === "order_status" && !orderIdOrNumber)) {
+    const result = await executeTool("list_my_orders", JSON.stringify({ limit: 5 }), ctx);
+    if (!result.ok) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}Order dekhne ke liye please sign in karein (/login), phir Account → Orders kholen.`
+            : `${prefix}Please sign in to view your orders, then open Account → Orders.`,
+        products: [],
+        handoff: false,
+        needsSignIn: true,
+      };
+    }
+    const data = result.data as {
+      count: number;
+      orders: Array<{ orderNumber: string; status: string; total: number }>;
+    };
+    if (!data.count) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}Is account par abhi koi order nahi mila. Agar aapne abhi order kiya hai, thodi der baad check karein ya Account → Orders dekhein.`
+            : `${prefix}No orders on this account yet. If you just placed one, refresh Account → Orders in a moment — or tell me your order number (ORD-…).`,
         products: [],
         handoff: false,
       };
     }
+    const lines = data.orders.map(formatOrderLine).join("\n");
+    return {
+      reply:
+        language === "hi"
+          ? `${prefix}Aapke recent orders:\n${lines}\n\nKisi ek ka status chahiye to order number bhejein.`
+          : `${prefix}Here are your recent orders:\n${lines}\n\nShare an order number if you want tracking details.`,
+      products: [],
+      handoff: false,
+    };
+  }
+
+  if (intent === "order_status") {
     const result = await executeTool(
       "get_order_status",
-      JSON.stringify({ orderIdOrNumber: orderMatch[1] }),
+      JSON.stringify(
+        orderIdOrNumber ? { orderIdOrNumber } : { latest: true }
+      ),
       ctx
     );
     if (!result.ok) {
-      const err = String((result.data as { error?: string }).error ?? "Order not found.");
-      const friendly = /authentication required/i.test(err)
-        ? "Please sign in to check order status, then send your order number."
-        : err;
+      const data = result.data as { error?: string; message?: string };
+      if (data.error === "auth_required") {
+        return {
+          reply:
+            language === "hi"
+              ? `${prefix}Order status ke liye please sign in karein (/login).`
+              : `${prefix}Please sign in to check order status.`,
+          products: [],
+          handoff: false,
+          needsSignIn: true,
+        };
+      }
       return {
-        reply: friendly,
+        reply:
+          language === "hi"
+            ? `${prefix}${data.message ?? "Order nahi mila. Order number (ORD-…) bhejein ya Account → Orders dekhein."}`
+            : `${prefix}${data.message ?? "I could not find that order. Share your ORD-… number or open Account → Orders."}`,
         products: [],
         handoff: false,
       };
@@ -113,66 +191,94 @@ export async function runMockChat(message: string, ctx: ToolContext): Promise<Mo
       trackingUrl?: string | null;
     };
     return {
-      reply: `Order ${d.orderNumber} is currently **${d.status.replace(/_/g, " ")}**. Total ₹${d.total.toLocaleString("en-IN")}${d.trackingUrl ? `. Track: ${d.trackingUrl}` : ""}.`,
+      reply:
+        language === "hi"
+          ? `${prefix}Order **${d.orderNumber}** abhi **${d.status.replace(/_/g, " ")}** hai. Total ₹${d.total.toLocaleString("en-IN")}${d.trackingUrl ? `. Track: ${d.trackingUrl}` : ""}.`
+          : `${prefix}Order **${d.orderNumber}** is currently **${d.status.replace(/_/g, " ")}**. Total ₹${d.total.toLocaleString("en-IN")}${d.trackingUrl ? `. Track: ${d.trackingUrl}` : ""}.`,
       products: [],
       handoff: false,
     };
   }
 
-  if (wantsKnowledge(message) && !extractWeave(message) && extractMaxPrice(message) == null) {
+  if (intent === "knowledge") {
     const result = await executeTool(
       "search_knowledge",
-      JSON.stringify({ query: message }),
+      JSON.stringify({ query: knowledgeQuery || message }),
       ctx
     );
-    const chunks = (result.data as { chunks?: Array<{ title: string; text: string }> }).chunks ?? [];
+    const chunks =
+      (result.data as { chunks?: Array<{ title: string; text: string }> }).chunks ?? [];
     if (!chunks.length) {
       return {
         reply:
-          "I do not have that policy loaded yet. Please see /faq, /returns, or /care — or ask a stylist at care@aadiora.com.",
+          language === "hi"
+            ? `${prefix}Yeh policy abhi load nahi hui. /faq, /returns, ya /care dekhein — ya care@aadiora.com.`
+            : `${prefix}I do not have that policy loaded yet. See /faq, /returns, or /care — or email care@aadiora.com.`,
         products: [],
         handoff: false,
       };
     }
-    // Prefer the most directly titled policy when several chunks score similarly
     const preferred =
-      chunks.find((c) => /return policy/i.test(c.title) && /\breturn/i.test(message)) ||
-      chunks.find((c) => /shipping free|delivery take/i.test(c.title) && /\b(ship|delivery)/i.test(message)) ||
+      chunks.find((c) => /return policy/i.test(c.title)) ||
+      chunks.find((c) => /shipping|delivery/i.test(c.title)) ||
       chunks[0];
+    const related = chunks
+      .filter((c) => c.title !== preferred.title)
+      .slice(0, 3)
+      .map((c) => c.title)
+      .join(", ");
     return {
-      reply: `**${preferred.title}**\n\n${preferred.text}${
-        chunks.length > 1
-          ? `\n\n(Also related: ${chunks
-              .filter((c) => c.title !== preferred.title)
-              .slice(0, 3)
-              .map((c) => c.title)
-              .join(", ")})`
-          : ""
-      }`,
+      reply: `**${preferred.title}**\n\n${preferred.text}${related ? `\n\n(Also related: ${related})` : ""}`,
       products: [],
       handoff: false,
     };
   }
 
-  // Default: product search
+  if (intent === "smalltalk") {
+    return {
+      reply:
+        language === "hi"
+          ? `${prefix}Namaste! Main AADIORA stylist hoon — weave, occasion, budget, orders, ya returns poochhein.`
+          : `${prefix}Welcome. Ask for a weave, occasion, or budget — or your orders, shipping, and returns. I only recommend pieces from our live catalog.`,
+      products: [],
+      handoff: false,
+    };
+  }
+
+  if (intent === "clarify") {
+    return {
+      reply:
+        language === "hi"
+          ? `${prefix}Main madad karungi — thoda batayein: occasion (wedding/festive), budget, ya weave (Banarasi/Kanjeevaram)? Orders ya returns bhi poochh sakte hain.`
+          : `${prefix}Happy to help — tell me an occasion (wedding/festive), a budget, or a weave (Banarasi, Kanjeevaram…). You can also ask about orders or returns.`,
+      products: [],
+      handoff: false,
+    };
+  }
+
+  // recommend or catalog
+  const isRecommend = intent === "recommend";
   const args = {
     weave: extractWeave(message),
     occasion: extractOccasion(message),
-    color: extractColor(message),
+    color: isRecommend ? undefined : extractColor(message),
     maxPrice: extractMaxPrice(message),
-    search: message.slice(0, 120),
+    search: isRecommend ? undefined : extractWeave(message) || extractColor(message) || undefined,
     inStock: true,
-    limit: 6,
+    sort: isRecommend ? ("featured" as const) : ("featured" as const),
+    limit: 4,
   };
 
   const result = await executeTool("search_products", JSON.stringify(args), ctx);
-  const products = result.products ?? [];
+  const products = (result.products ?? []).slice(0, 4);
   const total = (result.data as { total?: number }).total ?? products.length;
 
   if (!products.length) {
     return {
       reply:
-        "I could not find matching sarees in the live catalog. Try another weave (Banarasi, Kanjeevaram…), occasion, or budget — or ask about returns and shipping.",
+        language === "hi"
+          ? `${prefix}Live catalog mein match nahi mila. Koi aur weave, occasion, ya budget try karein.`
+          : `${prefix}I could not find matching sarees in the live catalog. Try another weave, occasion, or budget — or ask about returns and shipping.`,
       products: [],
       handoff: detectHandoff(message, ""),
     };
@@ -182,8 +288,16 @@ export async function runMockChat(message: string, ctx: ToolContext): Promise<Mo
     .map((p) => `• ${p.name} — ₹${p.price.toLocaleString("en-IN")}${p.inStock ? "" : " (unavailable)"}`)
     .join("\n");
 
+  const intro = isRecommend
+    ? language === "hi"
+      ? `${prefix}Yeh hamare featured in-stock handloom picks hain:`
+      : `${prefix}Here are popular in-stock handloom picks from our live catalog:`
+    : language === "hi"
+      ? `${prefix}Catalog mein ${total} pieces mile. Kuch options:`
+      : `${prefix}I found ${total} piece${total === 1 ? "" : "s"} in our catalog. Here are a few:`;
+
   return {
-    reply: `I found ${total} piece${total === 1 ? "" : "s"} in our catalog. Here are a few:\n${lines}\n\nOpen a card below for the full craft story and purchase.`,
+    reply: `${intro}\n${lines}\n\n${language === "hi" ? "Neeche card khol kar detail dekhein." : "Open a card below for the full craft story and purchase."}`,
     products,
     handoff: false,
   };

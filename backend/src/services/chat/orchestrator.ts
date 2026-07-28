@@ -13,17 +13,27 @@ import { validateAssistantReply, detectHandoff } from "./validator";
 import { runMockChat } from "./mock";
 import type { ProductCardPayload } from "../catalogQuery";
 
-const SYSTEM_PROMPT = `You are the AADIORA commerce assistant for a luxury handwoven saree boutique.
+function buildSystemPrompt(displayName?: string): string {
+  const nameLine = displayName
+    ? `The signed-in customer is named "${displayName}". Address them by name naturally when it fits. Never invent a different name.`
+    : `The visitor may be a guest. If they ask for their name or orders, use get_my_profile / list_my_orders (which will ask them to sign in). Never invent a name.`;
 
-Rules:
-- Never invent products, prices, SKUs, stock, or order details.
-- For catalog questions, call search_products or get_product before answering.
-- For shipping, returns, care, payments, sizing, or FAQ, call search_knowledge and answer only from returned chunks.
-- For order status, call get_order_status only when the customer provides an order id/number; if the tool says auth is required, ask them to sign in.
-- Keep tone warm, concise, and brand-appropriate (heritage handloom — not salesy).
-- If nothing matches, say so honestly and suggest refining filters or contacting care@aadiora.com.
-- When recommending products, mention only names and prices that appear in tool results.
-- If the customer asks for a human stylist or appointment, acknowledge and point them to care@aadiora.com or /appointments.`;
+  return `You are the AADIORA commerce assistant for a luxury handwoven saree boutique.
+
+${nameLine}
+
+Decision tree (always follow):
+1. Detect the user's language (English or Hindi/Hinglish). Reply in the same language. Tool arguments stay in English.
+2. Never invent products, prices, SKUs, stock, or order facts — only use tool results.
+3. Catalog / recommend → search_products (for "best/recommend" use sort=featured, inStock=true, limit=4; do NOT pass the full user sentence as search).
+4. Orders without an id → list_my_orders. Specific id or "latest" → get_order_status.
+5. Shipping, returns, care, payments, sizing, FAQ → search_knowledge (use English keywords).
+6. Name / identity → get_my_profile.
+7. Ambiguous ("something nice") → ask ONE clarifying question (occasion / budget / weave). Do not dump random catalog.
+8. If a tool fails: explain why and give a next step (sign in at /login, Account → Orders, care@aadiora.com).
+9. Human stylist / appointment → handoff to care@aadiora.com or /appointments.
+10. Keep tone warm, concise, heritage handloom — not salesy. Cap product mentions to what tools return.`;
+}
 
 const MAX_TOOL_ROUNDS = 3;
 const MAX_HISTORY_MESSAGES = 20;
@@ -34,27 +44,34 @@ export type ChatResponse = {
   products: ProductCardPayload[];
   handoff: boolean;
   mode: "llm" | "mock";
+  needsSignIn?: boolean;
+  displayName?: string;
 };
 
 function bumpExpiry(): Date {
   return new Date(Date.now() + CHAT_SESSION_TTL_MS);
 }
 
-function toLlmMessages(stored: IChatMessage[]): LlmMessage[] {
-  const out: LlmMessage[] = [{ role: "system", content: SYSTEM_PROMPT }];
+function toLlmMessages(stored: IChatMessage[], displayName?: string): LlmMessage[] {
+  const out: LlmMessage[] = [{ role: "system", content: buildSystemPrompt(displayName) }];
   const recent = stored.slice(-MAX_HISTORY_MESSAGES);
   for (const m of recent) {
     if (m.role === "user") {
       out.push({ role: "user", content: m.content });
     } else if (m.role === "assistant") {
+      // Mongoose array fields default to []; OpenAI/OpenRouter reject tool_calls: [].
+      const tool_calls =
+        m.toolCalls && m.toolCalls.length > 0
+          ? m.toolCalls.map((tc) => ({
+              id: tc.id,
+              type: "function" as const,
+              function: { name: tc.name, arguments: tc.arguments },
+            }))
+          : undefined;
       out.push({
         role: "assistant",
-        content: m.content || null,
-        tool_calls: m.toolCalls?.map((tc) => ({
-          id: tc.id,
-          type: "function" as const,
-          function: { name: tc.name, arguments: tc.arguments },
-        })),
+        content: m.content || (tool_calls ? null : ""),
+        ...(tool_calls ? { tool_calls } : {}),
       });
     } else if (m.role === "tool") {
       out.push({
@@ -71,6 +88,7 @@ export async function runChat(params: {
   sessionId?: string;
   message: string;
   userId?: string;
+  displayName?: string;
 }): Promise<ChatResponse> {
   const sessionId = params.sessionId?.trim() || randomUUID();
   const message = params.message.trim();
@@ -99,9 +117,13 @@ export async function runChat(params: {
     createdAt: new Date(),
   });
 
-  const ctx: ToolContext = { userId: params.userId };
+  const ctx: ToolContext = {
+    userId: params.userId,
+    displayName: params.displayName,
+  };
   const collectedProducts: ProductCardPayload[] = [];
   const orderFactParts: string[] = [];
+  let knowledgeUsed = false;
 
   // Mock path when no API key
   if (!hasLlmKey()) {
@@ -115,15 +137,20 @@ export async function runChat(params: {
     return {
       sessionId,
       reply: mock.reply,
-      products: mock.products,
+      products: mock.products.slice(0, 4),
       handoff: mock.handoff,
       mode: "mock",
+      needsSignIn: mock.needsSignIn,
+      displayName: params.displayName,
     };
   }
 
   // LLM tool loop
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const completion = await chatCompletion(toLlmMessages(session.messages), chatToolDefs);
+    const completion = await chatCompletion(
+      toLlmMessages(session.messages, params.displayName),
+      chatToolDefs
+    );
 
     if (completion.tool_calls?.length) {
       session.messages.push({
@@ -146,9 +173,13 @@ export async function runChat(params: {
             }
           }
         }
-        if (tc.function.name === "get_order_status" && result.ok) {
+        if (
+          (tc.function.name === "get_order_status" || tc.function.name === "list_my_orders") &&
+          result.ok
+        ) {
           orderFactParts.push(JSON.stringify(result.data));
         }
+        if (result.knowledgeUsed) knowledgeUsed = true;
         session.messages.push({
           role: "tool",
           content: JSON.stringify(result.data),
@@ -170,7 +201,8 @@ export async function runChat(params: {
     const reply = validateAssistantReply(
       rawReply,
       collectedProducts,
-      orderFactParts.join("\n")
+      orderFactParts.join("\n"),
+      { knowledgeUsed }
     );
     const handoff = detectHandoff(message, reply);
 
@@ -184,19 +216,20 @@ export async function runChat(params: {
     return {
       sessionId,
       reply,
-      products: collectedProducts.slice(0, 8),
+      products: collectedProducts.slice(0, 4),
       handoff,
       mode: "llm",
+      displayName: params.displayName,
     };
   }
 
-  // Exceeded tool rounds — synthesize from last products
   const reply = validateAssistantReply(
     collectedProducts.length
       ? "Here are pieces from our live catalog that match your request."
       : "I need a bit more detail — try naming a weave, occasion, or budget.",
     collectedProducts,
-    orderFactParts.join("\n")
+    orderFactParts.join("\n"),
+    { knowledgeUsed }
   );
 
   session.messages.push({
@@ -209,9 +242,10 @@ export async function runChat(params: {
   return {
     sessionId,
     reply,
-    products: collectedProducts.slice(0, 8),
+    products: collectedProducts.slice(0, 4),
     handoff: detectHandoff(message, reply),
     mode: "llm",
+    displayName: params.displayName,
   };
 }
 

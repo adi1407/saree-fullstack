@@ -38,9 +38,18 @@ function getClient(): OpenAI {
     throw new Error("LLM_API_KEY is not configured");
   }
   if (!client) {
+    const isOpenRouter = env.LLM_BASE_URL.includes("openrouter.ai");
     client = new OpenAI({
       apiKey: env.LLM_API_KEY,
       baseURL: env.LLM_BASE_URL,
+      ...(isOpenRouter
+        ? {
+            defaultHeaders: {
+              "HTTP-Referer": env.FRONTEND_URL,
+              "X-Title": "AADIORA Shop Assistant",
+            },
+          }
+        : {}),
     });
   }
   return client;
@@ -63,21 +72,24 @@ export async function chatCompletion(
     return { content: "I could not generate a reply just now. Please try again." };
   }
 
+  const tool_calls = choice.tool_calls
+    ?.filter(
+      (tc): tc is OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall =>
+        tc.type === "function"
+    )
+    .map((tc) => ({
+      id: tc.id,
+      type: "function" as const,
+      function: {
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+      },
+    }));
+
   return {
     content: choice.content,
-    tool_calls: choice.tool_calls
-      ?.filter(
-        (tc): tc is OpenAI.Chat.Completions.ChatCompletionMessageFunctionToolCall =>
-          tc.type === "function"
-      )
-      .map((tc) => ({
-        id: tc.id,
-        type: "function" as const,
-        function: {
-          name: tc.function.name,
-          arguments: tc.function.arguments,
-        },
-      })),
+    // Never return tool_calls: [] — providers reject empty arrays on replay.
+    ...(tool_calls && tool_calls.length > 0 ? { tool_calls } : {}),
   };
 }
 

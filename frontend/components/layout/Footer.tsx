@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { Container } from "@/components/ui/Container";
 import { NewsletterBlock } from "@/components/layout/NewsletterBlock.client";
+import { FooterVideoWordmark } from "@/components/layout/FooterVideoWordmark.client";
 import { BrandLogo } from "@/components/brand/BrandLogo";
 import { BRAND_DESCRIPTION, BRAND_EMAIL, BRAND_NAME } from "@/lib/brand";
 
@@ -78,11 +79,15 @@ export function Footer() {
         </div>
       </Container>
 
-      <Container className="border-t border-border py-6">
-        <p className="text-center text-small text-text-muted">
-          © {new Date().getFullYear()} {BRAND_NAME}. All rights reserved.
-        </p>
-      </Container>
+      <FooterVideoWordmark />
+
+      <div className="bg-ink">
+        <Container className="py-6">
+          <p className="text-center text-small text-secondary-muted/70">
+            © {new Date().getFullYear()} {BRAND_NAME}. All rights reserved.
+          </p>
+        </Container>
+      </div>
     </footer>
   );
 }

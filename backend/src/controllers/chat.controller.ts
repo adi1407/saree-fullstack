@@ -3,6 +3,7 @@ import { z } from "zod";
 import { asyncHandler } from "../utils/asyncHandler";
 import { AppError } from "../middleware/error.middleware";
 import { isChatEnabled, runChat } from "../services/chat/orchestrator";
+import { User } from "../models/User";
 
 const bodySchema = z.object({
   sessionId: z.string().min(1).optional(),
@@ -15,10 +16,18 @@ export const postChat = asyncHandler(async (req: Request, res: Response) => {
   }
 
   const { sessionId, message } = bodySchema.parse(req.body);
+
+  let displayName: string | undefined;
+  if (req.user?.userId) {
+    const user = await User.findById(req.user.userId).select("name").lean();
+    displayName = user?.name?.trim() || undefined;
+  }
+
   const result = await runChat({
     sessionId,
     message,
     userId: req.user?.userId,
+    displayName,
   });
 
   res.json({
@@ -29,6 +38,8 @@ export const postChat = asyncHandler(async (req: Request, res: Response) => {
       products: result.products,
       handoff: result.handoff,
       mode: result.mode,
+      needsSignIn: result.needsSignIn ?? false,
+      displayName: result.displayName ?? displayName ?? null,
     },
   });
 });
