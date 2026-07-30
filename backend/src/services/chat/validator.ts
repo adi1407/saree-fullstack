@@ -3,10 +3,29 @@ import type { ProductCardPayload } from "../catalogQuery";
 const FALLBACK =
   "I could not confirm matching pieces from our live catalog. Try refining weave, occasion, or budget — or ask me about shipping and returns.";
 
+const POLICY_FALLBACK =
+  "I could not confirm that detail from our store policies. Ask about shipping, returns, care, or payments — or email care@aadiora.com.";
+
 export type ValidateOptions = {
-  /** When true, policy INR (e.g. ₹199 shipping) is allowed without product cards */
+  /** When true, policy INR may be allowed if it appears in knowledgeText */
   knowledgeUsed?: boolean;
+  /** Raw text from knowledge tool chunks used this turn */
+  knowledgeText?: string;
 };
+
+function extractPriceMentions(text: string): string[] {
+  return [...text.matchAll(/(?:₹|INR\s*|Rs\.?\s*)(\d[\d,]*)/gi)].map((m) =>
+    m[1].replace(/,/g, "")
+  );
+}
+
+function amountInHaystack(amount: string, haystack: string): boolean {
+  if (!haystack) return false;
+  const num = Number(amount);
+  if (haystack.includes(amount)) return true;
+  if (Number.isFinite(num) && haystack.includes(num.toLocaleString("en-IN"))) return true;
+  return false;
+}
 
 /**
  * Ensures assistant copy does not invent product names or INR amounts
@@ -24,38 +43,49 @@ export function validateAssistantReply(
   const knownNames = new Set(products.map((p) => p.name.toLowerCase()));
   const knownPrices = new Set(products.map((p) => String(p.price)));
   const knownSkus = new Set(products.map((p) => p.sku.toLowerCase()));
-
-  const priceMentions = [...text.matchAll(/(?:₹|INR\s*|Rs\.?\s*)(\d[\d,]*)/gi)].map((m) =>
-    m[1].replace(/,/g, "")
-  );
-
+  const priceMentions = extractPriceMentions(text);
   const hasProductCards = products.length > 0;
+  const knowledgeText = (options.knowledgeText || "").trim();
+  const knowledgeGrounded = Boolean(options.knowledgeUsed && knowledgeText);
 
-  // Policy answers (knowledge tool) may cite shipping/COD amounts without products.
-  if (options.knowledgeUsed && !hasProductCards) {
+  // Knowledge-only: every cited INR must appear in retrieved chunks (or order facts).
+  if (knowledgeGrounded && !hasProductCards) {
+    for (const amount of priceMentions) {
+      if (!amountInHaystack(amount, knowledgeText) && !amountInHaystack(amount, orderFactsJson)) {
+        return POLICY_FALLBACK;
+      }
+    }
     return text;
+  }
+
+  // Flagged knowledgeUsed but no chunk text → do not trust policy INR.
+  if (options.knowledgeUsed && !knowledgeText && !hasProductCards && priceMentions.length) {
+    return POLICY_FALLBACK;
+  }
+
+  // Invented prices with no product cards and no grounded knowledge.
+  if (!hasProductCards && !knowledgeGrounded && priceMentions.length) {
+    return FALLBACK;
   }
 
   if (hasProductCards) {
     for (const amount of priceMentions) {
       const num = Number(amount);
       const inProducts = knownPrices.has(amount) || products.some((p) => Math.abs(p.price - num) < 1);
-      const inOrders =
-        orderFactsJson.includes(amount) ||
-        orderFactsJson.includes(num.toLocaleString("en-IN"));
-      if (!inProducts && !inOrders) {
+      const inOrders = amountInHaystack(amount, orderFactsJson);
+      const inKnowledge = knowledgeGrounded && amountInHaystack(amount, knowledgeText);
+      if (!inProducts && !inOrders && !inKnowledge) {
         return FALLBACK;
       }
     }
-  }
 
-  if (hasProductCards) {
     const claimsStock =
       /\b(in stock|available|here(?:'|’)s|i found|matching)\b/i.test(text) ||
       /₹\d/.test(text);
     if (claimsStock) {
-      const mentionsKnown = [...knownNames].some((n) => text.toLowerCase().includes(n));
-      const mentionsSku = [...knownSkus].some((s) => text.toLowerCase().includes(s));
+      const lower = text.toLowerCase();
+      const mentionsKnown = [...knownNames].some((n) => lower.includes(n));
+      const mentionsSku = [...knownSkus].some((s) => lower.includes(s));
       if (!mentionsKnown && !mentionsSku && priceMentions.length) {
         const lines = products
           .slice(0, 4)

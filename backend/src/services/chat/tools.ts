@@ -5,6 +5,7 @@ import { Order } from "../../models/Order";
 import { User } from "../../models/User";
 import { searchKnowledge } from "./rag";
 import { normalizeKnowledgeQuery } from "./intent";
+import { maskEmail } from "./sanitize";
 import type { LlmToolDef } from "./llm";
 import type { ProductCardPayload } from "../catalogQuery";
 
@@ -114,7 +115,7 @@ export const chatToolDefs: LlmToolDef[] = [
     function: {
       name: "get_my_profile",
       description:
-        "Return the signed-in customer's display name and email (no secrets). Use when asked about their name or identity.",
+        "Return the signed-in customer's display name and a masked email (no full address). Use when asked about their name or identity.",
       parameters: { type: "object", properties: {} },
     },
   },
@@ -288,7 +289,8 @@ export async function executeTool(
           ok: true,
           data: {
             name: user.name,
-            email: user.email ?? null,
+            emailMasked: maskEmail(user.email),
+            note: "Full email lives in Account settings — never invent an address.",
           },
         };
       }
@@ -306,7 +308,8 @@ export async function executeTool(
               score: c.score,
             })),
           },
-          knowledgeUsed: true,
+          // Only treat as grounded knowledge when chunks actually returned.
+          knowledgeUsed: chunks.length > 0,
         };
       }
       default:

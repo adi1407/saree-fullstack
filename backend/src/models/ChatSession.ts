@@ -19,6 +19,8 @@ export interface IChatMessage {
 export interface IChatSession extends Document {
   sessionId: string;
   userId?: Types.ObjectId;
+  /** Anonymous browser binding (HttpOnly cookie) when not signed in. */
+  guestKey?: string;
   messages: IChatMessage[];
   createdAt: Date;
   updatedAt: Date;
@@ -53,6 +55,7 @@ const chatSessionSchema = new Schema<IChatSession>(
   {
     sessionId: { type: String, required: true, unique: true, index: true },
     userId: { type: Schema.Types.ObjectId, ref: "User" },
+    guestKey: { type: String, index: true },
     messages: { type: [chatMessageSchema], default: [] },
     expiresAt: { type: Date, required: true },
   },

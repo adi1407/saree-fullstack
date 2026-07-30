@@ -43,7 +43,7 @@ type ChatApiResponse = {
     reply: string;
     products: ChatProduct[];
     handoff: boolean;
-    mode: "llm" | "mock";
+    mode: "llm" | "mock" | "degraded";
     needsSignIn?: boolean;
     displayName?: string | null;
   };

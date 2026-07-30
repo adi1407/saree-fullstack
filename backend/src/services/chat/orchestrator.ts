@@ -5,12 +5,14 @@ import {
   ChatSession,
   CHAT_SESSION_TTL_MS,
   type IChatMessage,
+  type IChatSession,
 } from "../../models/ChatSession";
 import { AppError } from "../../middleware/error.middleware";
-import { chatCompletion, hasLlmKey, type LlmMessage } from "./llm";
-import { chatToolDefs, executeTool, type ToolContext } from "./tools";
+import { chatCompletion, hasLlmKey, isLlmCircuitOpen, type LlmMessage } from "./llm";
+import { chatToolDefs, executeTool, type ToolContext, type ToolExecutionResult } from "./tools";
 import { validateAssistantReply, detectHandoff } from "./validator";
 import { runMockChat } from "./mock";
+import { persistableToolContent } from "./sanitize";
 import type { ProductCardPayload } from "../catalogQuery";
 
 function buildSystemPrompt(displayName?: string): string {
@@ -37,19 +39,32 @@ Decision tree (always follow):
 
 const MAX_TOOL_ROUNDS = 3;
 const MAX_HISTORY_MESSAGES = 20;
+const MAX_STORED_MESSAGES = 40;
 
 export type ChatResponse = {
   sessionId: string;
   reply: string;
   products: ProductCardPayload[];
   handoff: boolean;
-  mode: "llm" | "mock";
+  mode: "llm" | "mock" | "degraded";
   needsSignIn?: boolean;
   displayName?: string;
 };
 
 function bumpExpiry(): Date {
   return new Date(Date.now() + CHAT_SESSION_TTL_MS);
+}
+
+function trimStoredMessages(session: IChatSession): void {
+  if (session.messages.length > MAX_STORED_MESSAGES) {
+    session.messages = session.messages.slice(-MAX_STORED_MESSAGES);
+  }
+}
+
+function toolNeedsSignIn(result: ToolExecutionResult): boolean {
+  if (result.ok) return false;
+  const data = result.data as { error?: string } | null;
+  return data?.error === "auth_required";
 }
 
 function toLlmMessages(stored: IChatMessage[], displayName?: string): LlmMessage[] {
@@ -84,32 +99,113 @@ function toLlmMessages(stored: IChatMessage[], displayName?: string): LlmMessage
   return out;
 }
 
+/**
+ * Bind sessions to the signed-in user or an anonymous guestKey cookie.
+ * Mismatched owners get a fresh session (no cross-user history leak).
+ */
+async function resolveSession(params: {
+  sessionId?: string;
+  userId?: string;
+  guestKey: string;
+}): Promise<IChatSession> {
+  const requestedId = params.sessionId?.trim();
+  let session = requestedId ? await ChatSession.findOne({ sessionId: requestedId }) : null;
+
+  if (session) {
+    const ownerId = session.userId?.toString();
+    const allowed =
+      // Signed-in owner
+      (params.userId && ownerId && ownerId === params.userId) ||
+      // Guest continuing their own anonymous session
+      (!params.userId &&
+        !ownerId &&
+        (!session.guestKey || session.guestKey === params.guestKey)) ||
+      // Signed-in user claiming a prior guest session (same browser guestKey)
+      (params.userId &&
+        !ownerId &&
+        (!session.guestKey || session.guestKey === params.guestKey));
+
+    if (!allowed) {
+      session = null;
+    }
+  }
+
+  if (!session) {
+    return ChatSession.create({
+      sessionId: randomUUID(),
+      userId: params.userId ? new mongoose.Types.ObjectId(params.userId) : undefined,
+      guestKey: params.userId ? undefined : params.guestKey,
+      messages: [],
+      expiresAt: bumpExpiry(),
+    });
+  }
+
+  // Upgrade guest → authenticated; rotate sessionId so old links stop working.
+  if (params.userId && !session.userId) {
+    session.userId = new mongoose.Types.ObjectId(params.userId);
+    session.guestKey = undefined;
+    session.sessionId = randomUUID();
+  } else if (!params.userId && !session.guestKey) {
+    session.guestKey = params.guestKey;
+  }
+
+  session.expiresAt = bumpExpiry();
+  return session;
+}
+
+async function finishWithMock(params: {
+  session: IChatSession;
+  message: string;
+  ctx: ToolContext;
+  displayName?: string;
+  mode: "mock" | "degraded";
+  collectedProducts?: ProductCardPayload[];
+  needsSignIn?: boolean;
+}): Promise<ChatResponse> {
+  const mock = await runMockChat(params.message, params.ctx);
+  const products = (params.collectedProducts?.length ? params.collectedProducts : mock.products).slice(
+    0,
+    4
+  );
+  params.session.messages.push({
+    role: "assistant",
+    content: mock.reply,
+    createdAt: new Date(),
+  });
+  trimStoredMessages(params.session);
+  await params.session.save();
+  return {
+    sessionId: params.session.sessionId,
+    reply: mock.reply,
+    products,
+    handoff: mock.handoff,
+    mode: params.mode,
+    needsSignIn: params.needsSignIn || mock.needsSignIn,
+    displayName: params.displayName,
+  };
+}
+
 export async function runChat(params: {
   sessionId?: string;
   message: string;
   userId?: string;
   displayName?: string;
+  /** Required anonymous binding from HttpOnly cookie */
+  guestKey: string;
 }): Promise<ChatResponse> {
-  const sessionId = params.sessionId?.trim() || randomUUID();
   const message = params.message.trim();
   if (!message) {
     throw new AppError("Message is required", 400);
   }
-
-  let session = await ChatSession.findOne({ sessionId });
-  if (!session) {
-    session = await ChatSession.create({
-      sessionId,
-      userId: params.userId ? new mongoose.Types.ObjectId(params.userId) : undefined,
-      messages: [],
-      expiresAt: bumpExpiry(),
-    });
-  } else {
-    if (params.userId && !session.userId) {
-      session.userId = new mongoose.Types.ObjectId(params.userId);
-    }
-    session.expiresAt = bumpExpiry();
+  if (!params.guestKey?.trim()) {
+    throw new AppError("Missing chat guest binding", 400);
   }
+
+  const session = await resolveSession({
+    sessionId: params.sessionId,
+    userId: params.userId,
+    guestKey: params.guestKey.trim(),
+  });
 
   session.messages.push({
     role: "user",
@@ -124,129 +220,143 @@ export async function runChat(params: {
   const collectedProducts: ProductCardPayload[] = [];
   const orderFactParts: string[] = [];
   let knowledgeUsed = false;
+  let knowledgeText = "";
+  let needsSignIn = false;
 
-  // Mock path when no API key
-  if (!hasLlmKey()) {
-    const mock = await runMockChat(message, ctx);
-    session.messages.push({
-      role: "assistant",
-      content: mock.reply,
-      createdAt: new Date(),
-    });
-    await session.save();
-    return {
-      sessionId,
-      reply: mock.reply,
-      products: mock.products.slice(0, 4),
-      handoff: mock.handoff,
-      mode: "mock",
-      needsSignIn: mock.needsSignIn,
+  const useLlm = hasLlmKey() && !isLlmCircuitOpen();
+
+  if (!useLlm) {
+    return finishWithMock({
+      session,
+      message,
+      ctx,
       displayName: params.displayName,
-    };
+      mode: hasLlmKey() ? "degraded" : "mock",
+    });
   }
 
-  // LLM tool loop
-  for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-    const completion = await chatCompletion(
-      toLlmMessages(session.messages, params.displayName),
-      chatToolDefs
-    );
+  try {
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const completion = await chatCompletion(
+        toLlmMessages(session.messages, params.displayName),
+        chatToolDefs
+      );
 
-    if (completion.tool_calls?.length) {
-      session.messages.push({
-        role: "assistant",
-        content: completion.content || "",
-        toolCalls: completion.tool_calls.map((tc) => ({
-          id: tc.id,
-          name: tc.function.name,
-          arguments: tc.function.arguments,
-        })),
-        createdAt: new Date(),
-      });
-
-      for (const tc of completion.tool_calls) {
-        const result = await executeTool(tc.function.name, tc.function.arguments, ctx);
-        if (result.products?.length) {
-          for (const p of result.products) {
-            if (!collectedProducts.some((x) => x.slug === p.slug)) {
-              collectedProducts.push(p);
-            }
-          }
-        }
-        if (
-          (tc.function.name === "get_order_status" || tc.function.name === "list_my_orders") &&
-          result.ok
-        ) {
-          orderFactParts.push(JSON.stringify(result.data));
-        }
-        if (result.knowledgeUsed) knowledgeUsed = true;
+      if (completion.tool_calls?.length) {
         session.messages.push({
-          role: "tool",
-          content: JSON.stringify(result.data),
-          toolCallId: tc.id,
-          toolName: tc.function.name,
-          name: tc.function.name,
+          role: "assistant",
+          content: completion.content || "",
+          toolCalls: completion.tool_calls.map((tc) => ({
+            id: tc.id,
+            name: tc.function.name,
+            arguments: tc.function.arguments,
+          })),
           createdAt: new Date(),
         });
+
+        for (const tc of completion.tool_calls) {
+          const result = await executeTool(tc.function.name, tc.function.arguments, ctx);
+          if (toolNeedsSignIn(result)) needsSignIn = true;
+          if (result.products?.length) {
+            for (const p of result.products) {
+              if (!collectedProducts.some((x) => x.slug === p.slug)) {
+                collectedProducts.push(p);
+              }
+            }
+          }
+          if (
+            (tc.function.name === "get_order_status" || tc.function.name === "list_my_orders") &&
+            result.ok
+          ) {
+            orderFactParts.push(JSON.stringify(result.data));
+          }
+          if (result.knowledgeUsed) {
+            knowledgeUsed = true;
+            knowledgeText += `\n${typeof result.data === "string" ? result.data : JSON.stringify(result.data)}`;
+          }
+          session.messages.push({
+            role: "tool",
+            content: persistableToolContent(tc.function.name, result.data),
+            toolCallId: tc.id,
+            toolName: tc.function.name,
+            name: tc.function.name,
+            createdAt: new Date(),
+          });
+        }
+        continue;
       }
-      continue;
+
+      const rawReply =
+        completion.content?.trim() ||
+        (collectedProducts.length
+          ? "Here are pieces from our catalog that match your request."
+          : "I could not find matching pieces — try refining weave, occasion, or budget.");
+
+      const reply = validateAssistantReply(
+        rawReply,
+        collectedProducts,
+        orderFactParts.join("\n"),
+        { knowledgeUsed, knowledgeText }
+      );
+      const handoff = detectHandoff(message, reply);
+
+      session.messages.push({
+        role: "assistant",
+        content: reply,
+        createdAt: new Date(),
+      });
+      trimStoredMessages(session);
+      await session.save();
+
+      return {
+        sessionId: session.sessionId,
+        reply,
+        products: collectedProducts.slice(0, 4),
+        handoff,
+        mode: "llm",
+        needsSignIn,
+        displayName: params.displayName,
+      };
     }
 
-    const rawReply =
-      completion.content?.trim() ||
-      (collectedProducts.length
-        ? "Here are pieces from our catalog that match your request."
-        : "I could not find matching pieces — try refining weave, occasion, or budget.");
-
     const reply = validateAssistantReply(
-      rawReply,
+      collectedProducts.length
+        ? "Here are pieces from our live catalog that match your request."
+        : "I need a bit more detail — try naming a weave, occasion, or budget.",
       collectedProducts,
       orderFactParts.join("\n"),
-      { knowledgeUsed }
+      { knowledgeUsed, knowledgeText }
     );
-    const handoff = detectHandoff(message, reply);
 
     session.messages.push({
       role: "assistant",
       content: reply,
       createdAt: new Date(),
     });
+    trimStoredMessages(session);
     await session.save();
 
     return {
-      sessionId,
+      sessionId: session.sessionId,
       reply,
       products: collectedProducts.slice(0, 4),
-      handoff,
+      handoff: detectHandoff(message, reply),
       mode: "llm",
+      needsSignIn,
       displayName: params.displayName,
     };
+  } catch (err) {
+    console.error("[Chat] LLM path failed — degrading to mock", err);
+    return finishWithMock({
+      session,
+      message,
+      ctx,
+      displayName: params.displayName,
+      mode: "degraded",
+      collectedProducts,
+      needsSignIn,
+    });
   }
-
-  const reply = validateAssistantReply(
-    collectedProducts.length
-      ? "Here are pieces from our live catalog that match your request."
-      : "I need a bit more detail — try naming a weave, occasion, or budget.",
-    collectedProducts,
-    orderFactParts.join("\n"),
-    { knowledgeUsed }
-  );
-
-  session.messages.push({
-    role: "assistant",
-    content: reply,
-    createdAt: new Date(),
-  });
-  await session.save();
-
-  return {
-    sessionId,
-    reply,
-    products: collectedProducts.slice(0, 4),
-    handoff: detectHandoff(message, reply),
-    mode: "llm",
-    displayName: params.displayName,
-  };
 }
 
 export function isChatEnabled(): boolean {
