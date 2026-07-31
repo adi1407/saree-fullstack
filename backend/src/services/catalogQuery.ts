@@ -71,6 +71,7 @@ const sortMap: Record<string, Record<string, 1 | -1>> = {
 };
 
 export type ProductCardPayload = {
+  id: string;
   slug: string;
   name: string;
   price: number;
@@ -81,6 +82,7 @@ export type ProductCardPayload = {
 };
 
 function toCard(doc: {
+  _id: { toString(): string };
   slug: string;
   name: string;
   price: number;
@@ -90,6 +92,7 @@ function toCard(doc: {
   sku: string;
 }): ProductCardPayload {
   return {
+    id: doc._id.toString(),
     slug: doc.slug,
     name: doc.name,
     price: doc.price,

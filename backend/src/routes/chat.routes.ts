@@ -1,6 +1,6 @@
 import { Router } from "express";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { postChat } from "../controllers/chat.controller";
+import { postChat, postChatStream } from "../controllers/chat.controller";
 import { optionalAuth } from "../middleware/auth.middleware";
 
 const router = Router();
@@ -8,7 +8,6 @@ const router = Router();
 /** Auth first so limits can key by userId when signed in. */
 const chatLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
-  // Guests: tighter. Signed-in: slightly higher.
   max: (req) => (req.user?.userId ? 40 : 20),
   standardHeaders: true,
   legacyHeaders: false,
@@ -20,5 +19,6 @@ const chatLimiter = rateLimit({
 });
 
 router.post("/", optionalAuth, chatLimiter, postChat);
+router.post("/stream", optionalAuth, chatLimiter, postChatStream);
 
 export default router;

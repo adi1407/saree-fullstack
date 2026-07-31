@@ -18,7 +18,18 @@ const QUICK_CHIPS = [
   { label: "Talk to stylist", message: "I want to speak to a stylist" },
 ] as const;
 
+const STAGE_LABELS: Record<string, string> = {
+  thinking: "Thinking…",
+  searching_catalog: "Searching the catalog…",
+  checking_orders: "Checking your orders…",
+  checking_cart: "Checking your bag…",
+  starting_return: "Starting a return…",
+  searching_policies: "Looking up store policies…",
+  writing_reply: "Writing a reply…",
+};
+
 type ChatProduct = {
+  id?: string;
   slug: string;
   name: string;
   price: number;
@@ -36,18 +47,14 @@ type ChatTurn = {
   needsSignIn?: boolean;
 };
 
-type ChatApiResponse = {
-  success: boolean;
-  data: {
-    sessionId: string;
-    reply: string;
-    products: ChatProduct[];
-    handoff: boolean;
-    mode: "llm" | "mock" | "degraded";
-    needsSignIn?: boolean;
-    displayName?: string | null;
-  };
-  message?: string;
+type ChatResultData = {
+  sessionId: string;
+  reply: string;
+  products: ChatProduct[];
+  handoff: boolean;
+  mode: "llm" | "mock" | "degraded";
+  needsSignIn?: boolean;
+  displayName?: string | null;
 };
 
 function formatInr(n: number) {
@@ -56,9 +63,9 @@ function formatInr(n: number) {
 
 function welcomeText(name?: string | null) {
   if (name) {
-    return `Welcome back, ${name}. Ask for a weave, occasion, or budget — or your orders, shipping, and returns. I only recommend pieces from our live catalog.`;
+    return `Welcome back, ${name}. Ask for a weave, occasion, or budget — or your orders, bag, shipping, and returns. I only recommend pieces from our live catalog.`;
   }
-  return `Welcome to ${BRAND_NAME}. Ask for a weave, occasion, or budget — or shipping, returns, and care. Sign in to track orders by name. I only recommend pieces from our live catalog.`;
+  return `Welcome to ${BRAND_NAME}. Ask for a weave, occasion, or budget — or shipping, returns, and care. Sign in to track orders and use your bag. I only recommend pieces from our live catalog.`;
 }
 
 function renderPlain(text: string) {
@@ -79,15 +86,92 @@ function renderPlain(text: string) {
   });
 }
 
+async function streamChat(
+  body: { sessionId?: string; message: string },
+  signal: AbortSignal,
+  onStage: (stage: string) => void
+): Promise<ChatResultData> {
+  const res = await fetch("/api/chat/stream", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!res.ok) {
+    let message = "Something went wrong";
+    try {
+      const data = (await res.json()) as { message?: string };
+      message = data.message || message;
+    } catch {
+      // ignore
+    }
+    throw new Error(message);
+  }
+
+  if (!res.body) {
+    throw new Error("Chat stream unavailable");
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: ChatResultData | null = null;
+  let streamError: string | null = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+
+    for (const block of parts) {
+      const lines = block.split("\n");
+      let event = "message";
+      let dataLine = "";
+      for (const line of lines) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) dataLine += line.slice(5).trim();
+      }
+      if (!dataLine) continue;
+      try {
+        const data = JSON.parse(dataLine) as Record<string, unknown>;
+        if (event === "stage" && typeof data.stage === "string") {
+          onStage(data.stage);
+        } else if (event === "result") {
+          result = data as unknown as ChatResultData;
+        } else if (event === "error") {
+          streamError = typeof data.message === "string" ? data.message : "Chat failed";
+        } else if (event === "aborted") {
+          throw new DOMException("Aborted", "AbortError");
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") throw err;
+        // ignore malformed chunks
+      }
+    }
+  }
+
+  if (streamError) throw new Error(streamError);
+  if (!result) throw new Error("No reply from stylist");
+  return result;
+}
+
 export function ChatWidget() {
   const panelId = useId();
   const [open, setOpen] = useState(false);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [stageLabel, setStageLabel] = useState(STAGE_LABELS.thinking);
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [userName, setUserName] = useState<string | null>(null);
   const [showChips, setShowChips] = useState(true);
+  const [addingSlug, setAddingSlug] = useState<string | null>(null);
+  const [bagNote, setBagNote] = useState<string | null>(null);
   const [turns, setTurns] = useState<ChatTurn[]>([
     {
       id: "welcome",
@@ -97,6 +181,7 @@ export function ChatWidget() {
   ]);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     try {
@@ -129,16 +214,53 @@ export function ChatWidget() {
     if (!open) return;
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
     inputRef.current?.focus();
-  }, [open, turns, loading]);
+  }, [open, turns, loading, stageLabel]);
+
+  const closePanel = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setOpen(false);
+    setLoading(false);
+  }, []);
+
+  const addToBag = useCallback(async (product: ChatProduct) => {
+    if (!product.id && !product.slug) return;
+    setAddingSlug(product.slug);
+    setBagNote(null);
+    try {
+      await apiClient.post("/api/cart/items", {
+        sareeId: product.id,
+        qty: 1,
+      });
+      setBagNote(`Added ${product.name} to your bag.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Could not add to bag";
+      if (msg.toLowerCase().includes("auth") || msg.toLowerCase().includes("sign")) {
+        setBagNote("Sign in to add pieces to your bag.");
+      } else if (!product.id) {
+        setBagNote("Open the product page to add this piece — card id missing.");
+      } else {
+        setBagNote(msg);
+      }
+    } finally {
+      setAddingSlug(null);
+    }
+  }, []);
 
   const sendMessage = useCallback(
     async (raw: string) => {
       const message = raw.trim();
       if (!message || loading) return;
 
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
       setInput("");
       setError(null);
+      setBagNote(null);
       setShowChips(false);
+      setStageLabel(STAGE_LABELS.thinking);
       const userTurn: ChatTurn = {
         id: `u-${Date.now()}`,
         role: "user",
@@ -148,12 +270,13 @@ export function ChatWidget() {
       setLoading(true);
 
       try {
-        const res = await apiClient.post<ChatApiResponse>("/api/chat", {
-          sessionId: sessionId ?? undefined,
-          message,
-        });
+        const data = await streamChat(
+          { sessionId: sessionId ?? undefined, message },
+          controller.signal,
+          (stage) => setStageLabel(STAGE_LABELS[stage] ?? STAGE_LABELS.thinking)
+        );
 
-        const nextSession = res.data.sessionId;
+        const nextSession = data.sessionId;
         setSessionId(nextSession);
         try {
           sessionStorage.setItem(SESSION_KEY, nextSession);
@@ -161,8 +284,8 @@ export function ChatWidget() {
           // ignore
         }
 
-        if (res.data.displayName) {
-          setUserName(res.data.displayName);
+        if (data.displayName) {
+          setUserName(data.displayName);
         }
 
         setTurns((prev) => [
@@ -170,13 +293,16 @@ export function ChatWidget() {
           {
             id: `a-${Date.now()}`,
             role: "assistant",
-            content: res.data.reply,
-            products: res.data.products?.length ? res.data.products : undefined,
-            handoff: res.data.handoff,
-            needsSignIn: res.data.needsSignIn,
+            content: data.reply,
+            products: data.products?.length ? data.products : undefined,
+            handoff: data.handoff,
+            needsSignIn: data.needsSignIn,
           },
         ]);
       } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") {
+          return;
+        }
         const msg = err instanceof Error ? err.message : "Chat unavailable";
         setError(msg);
         setTurns((prev) => [
@@ -187,10 +313,13 @@ export function ChatWidget() {
             content:
               msg.includes("unavailable") || msg.includes("503")
                 ? "Chat is temporarily unavailable. Browse the catalog or email care@aadiora.com."
-                : "Something went wrong sending that message. Please try again.",
+                : msg.includes("Too many")
+                  ? "Too many messages just now — please wait a minute and try again."
+                  : "Something went wrong sending that message. Please try again.",
           },
         ]);
       } finally {
+        if (abortRef.current === controller) abortRef.current = null;
         setLoading(false);
       }
     },
@@ -238,7 +367,7 @@ export function ChatWidget() {
               </div>
               <button
                 type="button"
-                onClick={() => setOpen(false)}
+                onClick={closePanel}
                 className="rounded-full p-2 text-secondary-muted/80 transition-colors hover:bg-white/5 hover:text-secondary"
                 aria-label="Close chat"
               >
@@ -265,16 +394,16 @@ export function ChatWidget() {
                   {turn.products && turn.products.length > 0 && (
                     <ul className="mt-3 space-y-2">
                       {turn.products.map((p) => (
-                        <li key={p.slug}>
+                        <li key={p.slug} className="border border-border/80 bg-surface p-1.5">
                           <Link
                             href={`/sarees/${p.slug}`}
-                            className="flex gap-2 border border-border/80 bg-surface p-1.5 transition-colors hover:border-secondary"
+                            className="flex gap-2 transition-colors hover:border-secondary"
                           >
                             <div className="relative h-16 w-12 shrink-0 overflow-hidden bg-background-alt">
                               {p.image ? (
                                 <Image
                                   src={p.image}
-                                  alt=""
+                                  alt={p.name}
                                   fill
                                   className="object-cover"
                                   sizes="48px"
@@ -290,6 +419,16 @@ export function ChatWidget() {
                               <span className="text-eyebrow text-primary">View →</span>
                             </div>
                           </Link>
+                          {p.inStock && p.id ? (
+                            <button
+                              type="button"
+                              disabled={addingSlug === p.slug}
+                              onClick={() => void addToBag(p)}
+                              className="mt-1.5 w-full border border-secondary/40 bg-background px-2 py-1 text-eyebrow text-ink transition-colors hover:border-secondary disabled:opacity-50"
+                            >
+                              {addingSlug === p.slug ? "Adding…" : "Add to bag"}
+                            </button>
+                          ) : null}
                         </li>
                       ))}
                     </ul>
@@ -300,7 +439,7 @@ export function ChatWidget() {
                       <Link href="/login" className="text-primary underline-offset-2 hover:underline">
                         Sign in
                       </Link>{" "}
-                      to view orders and personalize your chat.
+                      to view orders, use your bag, and personalize chat.
                     </p>
                   )}
 
@@ -333,9 +472,16 @@ export function ChatWidget() {
             )}
 
             {loading && (
-              <p className="text-eyebrow text-text-muted" aria-live="polite">
-                Looking through the catalog…
-              </p>
+              <div className="flex items-center justify-between gap-2" aria-live="polite">
+                <p className="text-eyebrow text-text-muted">{stageLabel}</p>
+                <button
+                  type="button"
+                  onClick={() => abortRef.current?.abort()}
+                  className="text-eyebrow text-primary underline-offset-2 hover:underline"
+                >
+                  Cancel
+                </button>
+              </div>
             )}
           </div>
 
@@ -349,6 +495,14 @@ export function ChatWidget() {
             {error && (
               <p className="mb-2 text-eyebrow text-error" role="alert">
                 {error}
+              </p>
+            )}
+            {bagNote && !error && (
+              <p className="mb-2 text-eyebrow text-text-muted" role="status">
+                {bagNote}{" "}
+                <Link href="/cart" className="text-primary underline-offset-2 hover:underline">
+                  View bag
+                </Link>
               </p>
             )}
             <div className="flex gap-2">
@@ -381,7 +535,10 @@ export function ChatWidget() {
         aria-expanded={open}
         aria-controls={panelId}
         aria-label={open ? `Close ${BRAND_NAME} stylist` : `Ask ${BRAND_NAME} stylist`}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          if (open) closePanel();
+          else setOpen(true);
+        }}
       >
         {!open && (
           <span

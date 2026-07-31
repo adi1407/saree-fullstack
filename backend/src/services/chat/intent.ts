@@ -8,6 +8,8 @@ export type ChatIntent =
   | "recommend"
   | "order_list"
   | "order_status"
+  | "return_start"
+  | "cart"
   | "knowledge"
   | "account_identity"
   | "handoff"
@@ -89,13 +91,33 @@ export function classifyIntent(message: string): IntentResult {
     return { intent: "account_identity", language };
   }
 
+  const orderId = extractOrderId(raw);
+
+  // Start a return (action) — before generic order/policy cues
+  if (
+    /\b((start|initiate|begin|file|open|request)\s+(a\s+)?return|return\s+(my\s+)?order|return\s+this|i want to return)\b/i.test(
+      lower
+    ) ||
+    /vapas karna|return shuru|वापसी शुरू|वापस करना/.test(lower)
+  ) {
+    return { intent: "return_start", language, orderIdOrNumber: orderId };
+  }
+
+  // Cart / bag
+  if (
+    /\b(my (cart|bag)|shopping bag|add to (cart|bag)|what(?:'s| is) in my (cart|bag)|show (my )?(cart|bag))\b/i.test(
+      lower
+    ) ||
+    /\b(mera bag|cart mein|bag mein)\b/i.test(lower)
+  ) {
+    return { intent: "cart", language };
+  }
+
   // Orders — list (no specific id needed)
   const orderListCue =
     /\b(orders?|my order|placed (an? )?order|order (of )?mine|track my|any order)\b/i.test(lower) ||
     /\b(mera (kuch )?order|mere order|order hai|order hain|ऑर्डर)\b/i.test(lower) ||
     /just placed/.test(lower);
-
-  const orderId = extractOrderId(raw);
 
   if (orderId && (orderListCue || /\b(status|track|where)\b/i.test(lower))) {
     return { intent: "order_status", language, orderIdOrNumber: orderId };

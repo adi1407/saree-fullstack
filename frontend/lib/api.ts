@@ -46,14 +46,15 @@ export async function api<T>(
 }
 
 export const apiClient = {
-  get: <T>(endpoint: string, params?: Record<string, string | number | undefined>) =>
-    api<T>(endpoint, { method: "GET", params }),
+  get: <T>(endpoint: string, params?: Record<string, string | number | undefined>, init?: RequestInit) =>
+    api<T>(endpoint, { method: "GET", params, ...init }),
 
-  post: <T>(endpoint: string, body?: unknown) =>
-    api<T>(endpoint, { method: "POST", body: JSON.stringify(body) }),
+  post: <T>(endpoint: string, body?: unknown, init?: RequestInit) =>
+    api<T>(endpoint, { method: "POST", body: JSON.stringify(body), ...init }),
 
-  patch: <T>(endpoint: string, body?: unknown) =>
-    api<T>(endpoint, { method: "PATCH", body: JSON.stringify(body) }),
+  patch: <T>(endpoint: string, body?: unknown, init?: RequestInit) =>
+    api<T>(endpoint, { method: "PATCH", body: JSON.stringify(body), ...init }),
 
-  delete: <T>(endpoint: string) => api<T>(endpoint, { method: "DELETE" }),
+  delete: <T>(endpoint: string, init?: RequestInit) =>
+    api<T>(endpoint, { method: "DELETE", ...init }),
 };

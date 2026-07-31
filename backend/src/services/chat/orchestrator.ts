@@ -9,16 +9,34 @@ import {
 } from "../../models/ChatSession";
 import { AppError } from "../../middleware/error.middleware";
 import { chatCompletion, hasLlmKey, isLlmCircuitOpen, type LlmMessage } from "./llm";
-import { chatToolDefs, executeTool, type ToolContext, type ToolExecutionResult } from "./tools";
+import {
+  chatToolDefs,
+  executeTool,
+  stageForTool,
+  type ChatStage,
+  type ToolContext,
+  type ToolExecutionResult,
+} from "./tools";
 import { validateAssistantReply, detectHandoff } from "./validator";
 import { runMockChat } from "./mock";
 import { persistableToolContent } from "./sanitize";
 import type { ProductCardPayload } from "../catalogQuery";
 
+export class ChatAbortedError extends Error {
+  constructor() {
+    super("Chat aborted");
+    this.name = "ChatAbortedError";
+  }
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ChatAbortedError();
+}
+
 function buildSystemPrompt(displayName?: string): string {
   const nameLine = displayName
     ? `The signed-in customer is named "${displayName}". Address them by name naturally when it fits. Never invent a different name.`
-    : `The visitor may be a guest. If they ask for their name or orders, use get_my_profile / list_my_orders (which will ask them to sign in). Never invent a name.`;
+    : `The visitor may be a guest. If they ask for their name, orders, bag, or returns, use the matching tools (which will ask them to sign in). Never invent a name.`;
 
   return `You are the AADIORA commerce assistant for a luxury handwoven saree boutique.
 
@@ -29,12 +47,14 @@ Decision tree (always follow):
 2. Never invent products, prices, SKUs, stock, or order facts — only use tool results.
 3. Catalog / recommend → search_products (for "best/recommend" use sort=featured, inStock=true, limit=4; do NOT pass the full user sentence as search).
 4. Orders without an id → list_my_orders. Specific id or "latest" → get_order_status.
-5. Shipping, returns, care, payments, sizing, FAQ → search_knowledge (use English keywords).
-6. Name / identity → get_my_profile.
-7. Ambiguous ("something nice") → ask ONE clarifying question (occasion / budget / weave). Do not dump random catalog.
-8. If a tool fails: explain why and give a next step (sign in at /login, Account → Orders, care@aadiora.com).
-9. Human stylist / appointment → handoff to care@aadiora.com or /appointments.
-10. Keep tone warm, concise, heritage handloom — not salesy. Cap product mentions to what tools return.`;
+5. Initiate a return (not just ask policy) → start_return. Policy-only questions → search_knowledge.
+6. Bag / cart → get_cart. "Add this" after a recommendation → add_to_cart with that slug.
+7. Shipping, returns policy, care, payments, sizing, FAQ → search_knowledge (use English keywords).
+8. Name / identity → get_my_profile.
+9. Ambiguous ("something nice") → ask ONE clarifying question (occasion / budget / weave). Do not dump random catalog.
+10. If a tool fails: explain why and give a next step (sign in at /login, Account → Orders, /cart, care@aadiora.com).
+11. Human stylist / appointment → handoff to care@aadiora.com or /appointments.
+12. Keep tone warm, concise, heritage handloom — not salesy. Cap product mentions to what tools return.`;
 }
 
 const MAX_TOOL_ROUNDS = 3;
@@ -192,6 +212,8 @@ export async function runChat(params: {
   displayName?: string;
   /** Required anonymous binding from HttpOnly cookie */
   guestKey: string;
+  signal?: AbortSignal;
+  onStage?: (stage: ChatStage) => void;
 }): Promise<ChatResponse> {
   const message = params.message.trim();
   if (!message) {
@@ -200,6 +222,17 @@ export async function runChat(params: {
   if (!params.guestKey?.trim()) {
     throw new AppError("Missing chat guest binding", 400);
   }
+
+  const emit = (stage: ChatStage) => {
+    try {
+      params.onStage?.(stage);
+    } catch {
+      // ignore listener errors
+    }
+  };
+
+  assertNotAborted(params.signal);
+  emit("thinking");
 
   const session = await resolveSession({
     sessionId: params.sessionId,
@@ -226,6 +259,7 @@ export async function runChat(params: {
   const useLlm = hasLlmKey() && !isLlmCircuitOpen();
 
   if (!useLlm) {
+    emit("writing_reply");
     return finishWithMock({
       session,
       message,
@@ -237,10 +271,13 @@ export async function runChat(params: {
 
   try {
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      assertNotAborted(params.signal);
+      emit(round === 0 ? "thinking" : "writing_reply");
       const completion = await chatCompletion(
         toLlmMessages(session.messages, params.displayName),
         chatToolDefs
       );
+      assertNotAborted(params.signal);
 
       if (completion.tool_calls?.length) {
         session.messages.push({
@@ -255,6 +292,8 @@ export async function runChat(params: {
         });
 
         for (const tc of completion.tool_calls) {
+          assertNotAborted(params.signal);
+          emit(stageForTool(tc.function.name));
           const result = await executeTool(tc.function.name, tc.function.arguments, ctx);
           if (toolNeedsSignIn(result)) needsSignIn = true;
           if (result.products?.length) {
@@ -265,7 +304,9 @@ export async function runChat(params: {
             }
           }
           if (
-            (tc.function.name === "get_order_status" || tc.function.name === "list_my_orders") &&
+            (tc.function.name === "get_order_status" ||
+              tc.function.name === "list_my_orders" ||
+              tc.function.name === "start_return") &&
             result.ok
           ) {
             orderFactParts.push(JSON.stringify(result.data));
@@ -286,6 +327,7 @@ export async function runChat(params: {
         continue;
       }
 
+      emit("writing_reply");
       const rawReply =
         completion.content?.trim() ||
         (collectedProducts.length
@@ -319,6 +361,7 @@ export async function runChat(params: {
       };
     }
 
+    emit("writing_reply");
     const reply = validateAssistantReply(
       collectedProducts.length
         ? "Here are pieces from our live catalog that match your request."
@@ -346,7 +389,9 @@ export async function runChat(params: {
       displayName: params.displayName,
     };
   } catch (err) {
+    if (err instanceof ChatAbortedError) throw err;
     console.error("[Chat] LLM path failed — degrading to mock", err);
+    emit("writing_reply");
     return finishWithMock({
       session,
       message,

@@ -3,6 +3,10 @@ import mongoose from "mongoose";
 import { getCatalogProduct, searchCatalog } from "../catalogQuery";
 import { Order } from "../../models/Order";
 import { User } from "../../models/User";
+import { Cart } from "../../models/Cart";
+import { Saree } from "../../models/Saree";
+import { ReturnRequest } from "../../models/ReturnRequest";
+import { isValidObjectId, sanitizeCart } from "../../utils/cart";
 import { searchKnowledge } from "./rag";
 import { normalizeKnowledgeQuery } from "./intent";
 import { maskEmail } from "./sanitize";
@@ -35,6 +39,16 @@ const getOrderStatusSchema = z.object({
 
 const searchKnowledgeSchema = z.object({
   query: z.string().min(1),
+});
+
+const addToCartSchema = z.object({
+  slugOrId: z.string().min(1),
+  qty: z.number().int().min(1).max(5).optional(),
+});
+
+const startReturnSchema = z.object({
+  orderIdOrNumber: z.string().min(1).optional(),
+  reason: z.string().min(3).max(500).optional(),
 });
 
 export const chatToolDefs: LlmToolDef[] = [
@@ -100,13 +114,55 @@ export const chatToolDefs: LlmToolDef[] = [
     function: {
       name: "get_order_status",
       description:
-        "Look up one order for the authenticated customer by order id/number, or latest=true for their most recent order.",
+        "Look up one order for the authenticated customer by order id/number, or latest=true for their most recent order. Returns line items, payment method, and tracking.",
       parameters: {
         type: "object",
         properties: {
           orderIdOrNumber: { type: "string" },
           latest: { type: "boolean" },
         },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "start_return",
+      description:
+        "Start a return request for an eligible order (delivered/shipped, within policy window). Prefer when the user wants to initiate a return, not only ask about the policy.",
+      parameters: {
+        type: "object",
+        properties: {
+          orderIdOrNumber: {
+            type: "string",
+            description: "Order number or id; omit to use latest eligible order",
+          },
+          reason: { type: "string", description: "Brief reason for the return" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "get_cart",
+      description: "Show the signed-in customer's shopping bag (items, quantities, subtotal).",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "add_to_cart",
+      description:
+        "Add a published saree to the signed-in customer's bag by slug or id. Use after recommending a piece when they ask to add it.",
+      parameters: {
+        type: "object",
+        properties: {
+          slugOrId: { type: "string" },
+          qty: { type: "integer", minimum: 1, maximum: 5 },
+        },
+        required: ["slugOrId"],
       },
     },
   },
@@ -147,26 +203,104 @@ export type ToolExecutionResult = {
   products?: ProductCardPayload[];
   /** When true, reply may mention policy INR amounts without product cards */
   knowledgeUsed?: boolean;
+  /** Hint for UI stage labels */
+  stageHint?: ChatStage;
 };
 
+export type ChatStage =
+  | "thinking"
+  | "searching_catalog"
+  | "checking_orders"
+  | "checking_cart"
+  | "starting_return"
+  | "searching_policies"
+  | "writing_reply";
+
+export function stageForTool(name: string): ChatStage {
+  switch (name) {
+    case "search_products":
+    case "get_product":
+      return "searching_catalog";
+    case "list_my_orders":
+    case "get_order_status":
+      return "checking_orders";
+    case "get_cart":
+    case "add_to_cart":
+      return "checking_cart";
+    case "start_return":
+      return "starting_return";
+    case "search_knowledge":
+      return "searching_policies";
+    default:
+      return "thinking";
+  }
+}
+
 function summarizeOrder(order: {
+  _id?: { toString(): string };
   orderNumber: string;
   status: string;
-  amounts: { total: number };
+  amounts: { subtotal?: number; shipping?: number; tax?: number; total: number };
+  paymentMethod?: string | null;
   awb?: string | null;
   trackingUrl?: string | null;
-  items: unknown[];
+  items: Array<{
+    name?: string;
+    slug?: string;
+    price?: number;
+    qty?: number;
+  }>;
   createdAt: Date;
+  updatedAt?: Date;
 }) {
   return {
+    orderId: order._id?.toString(),
     orderNumber: order.orderNumber,
     status: order.status,
     total: order.amounts.total,
+    subtotal: order.amounts.subtotal ?? null,
+    shipping: order.amounts.shipping ?? null,
+    paymentMethod: order.paymentMethod ?? null,
     awb: order.awb ?? null,
     trackingUrl: order.trackingUrl ?? null,
     itemCount: order.items.length,
+    items: order.items.map((i) => ({
+      name: i.name,
+      slug: i.slug,
+      price: i.price,
+      qty: i.qty,
+    })),
     createdAt: order.createdAt,
+    updatedAt: order.updatedAt ?? null,
   };
+}
+
+const RETURN_ELIGIBLE = new Set(["delivered", "shipped"]);
+const RETURN_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+
+function authRequired(message: string): ToolExecutionResult {
+  return {
+    ok: false,
+    data: {
+      error: "auth_required",
+      message,
+      signInPath: "/login",
+    },
+  };
+}
+
+async function findUserOrder(userId: string, orderIdOrNumber?: string, latest?: boolean) {
+  if (latest || !orderIdOrNumber) {
+    return Order.findOne({ userId }).sort({ createdAt: -1 }).lean();
+  }
+  const idOrNumber = orderIdOrNumber.trim();
+  const query: Record<string, unknown> = { userId };
+  if (mongoose.isValidObjectId(idOrNumber)) {
+    query.$or = [{ _id: idOrNumber }, { orderNumber: idOrNumber }];
+  } else {
+    query.orderNumber = idOrNumber;
+  }
+  return Order.findOne(query).lean();
 }
 
 export async function executeTool(
@@ -195,6 +329,7 @@ export async function executeTool(
           ok: true,
           data: { total: result.total, products: result.products },
           products: result.products,
+          stageHint: "searching_catalog",
         };
       }
       case "get_product": {
@@ -207,18 +342,12 @@ export async function executeTool(
           ok: true,
           data: { product },
           products: [product],
+          stageHint: "searching_catalog",
         };
       }
       case "list_my_orders": {
         if (!ctx.userId) {
-          return {
-            ok: false,
-            data: {
-              error: "auth_required",
-              message: "Please sign in to view your orders.",
-              signInPath: "/login",
-            },
-          };
+          return authRequired("Please sign in to view your orders.");
         }
         const limit = Math.min(10, Math.max(1, Number((args as { limit?: number }).limit ?? 5)));
         const orders = await Order.find({ userId: ctx.userId })
@@ -231,33 +360,19 @@ export async function executeTool(
             count: orders.length,
             orders: orders.map(summarizeOrder),
           },
+          stageHint: "checking_orders",
         };
       }
       case "get_order_status": {
         if (!ctx.userId) {
-          return {
-            ok: false,
-            data: {
-              error: "auth_required",
-              message: "Please sign in to check order status.",
-              signInPath: "/login",
-            },
-          };
+          return authRequired("Please sign in to check order status.");
         }
         const parsed = getOrderStatusSchema.parse(args);
-        let order = null;
-        if (parsed.latest || !parsed.orderIdOrNumber) {
-          order = await Order.findOne({ userId: ctx.userId }).sort({ createdAt: -1 }).lean();
-        } else {
-          const idOrNumber = parsed.orderIdOrNumber.trim();
-          const query: Record<string, unknown> = { userId: ctx.userId };
-          if (mongoose.isValidObjectId(idOrNumber)) {
-            query.$or = [{ _id: idOrNumber }, { orderNumber: idOrNumber }];
-          } else {
-            query.orderNumber = idOrNumber;
-          }
-          order = await Order.findOne(query).lean();
-        }
+        const order = await findUserOrder(
+          ctx.userId,
+          parsed.orderIdOrNumber,
+          parsed.latest || !parsed.orderIdOrNumber
+        );
         if (!order) {
           return {
             ok: false,
@@ -268,18 +383,191 @@ export async function executeTool(
             },
           };
         }
-        return { ok: true, data: summarizeOrder(order) };
+        return { ok: true, data: summarizeOrder(order), stageHint: "checking_orders" };
       }
-      case "get_my_profile": {
+      case "start_return": {
         if (!ctx.userId) {
+          return authRequired("Please sign in to start a return.");
+        }
+        const parsed = startReturnSchema.parse(args);
+        const order = await findUserOrder(
+          ctx.userId,
+          parsed.orderIdOrNumber,
+          !parsed.orderIdOrNumber
+        );
+        if (!order) {
           return {
             ok: false,
             data: {
-              error: "auth_required",
-              message: "You are browsing as a guest. Sign in so I can greet you by name.",
-              signInPath: "/login",
+              error: "not_found",
+              message: "No order found to return. Share your ORD-… number or open Account → Orders.",
             },
+            stageHint: "starting_return",
           };
+        }
+        if (!RETURN_ELIGIBLE.has(order.status)) {
+          return {
+            ok: false,
+            data: {
+              error: "not_eligible",
+              message: `Order ${order.orderNumber} is ${order.status.replace(/_/g, " ")} and cannot be returned yet. Returns apply after shipping/delivery.`,
+              order: summarizeOrder(order),
+            },
+            stageHint: "starting_return",
+          };
+        }
+        const ageMs = Date.now() - new Date(order.updatedAt || order.createdAt).getTime();
+        if (ageMs > RETURN_WINDOW_MS) {
+          return {
+            ok: false,
+            data: {
+              error: "not_eligible",
+              message: `Order ${order.orderNumber} is outside the return window (typically 7–14 days after delivery). Email care@aadiora.com if you need help.`,
+              order: summarizeOrder(order),
+            },
+            stageHint: "starting_return",
+          };
+        }
+        const reason = (parsed.reason || "Customer requested return via chat").slice(0, 500);
+        try {
+          const doc = await ReturnRequest.findOneAndUpdate(
+            { userId: ctx.userId, orderId: order._id },
+            {
+              $setOnInsert: {
+                userId: ctx.userId,
+                orderId: order._id,
+                orderNumber: order.orderNumber,
+                reason,
+                status: "requested",
+              },
+            },
+            { upsert: true, new: true }
+          ).lean();
+          return {
+            ok: true,
+            data: {
+              status: doc?.status ?? "requested",
+              orderNumber: order.orderNumber,
+              reason: doc?.reason ?? reason,
+              nextStep:
+                "Our care team will email pickup/refund instructions. You can also write care@aadiora.com with this order number.",
+              order: summarizeOrder(order),
+            },
+            stageHint: "starting_return",
+          };
+        } catch (err) {
+          const existing = await ReturnRequest.findOne({
+            userId: ctx.userId,
+            orderId: order._id,
+          }).lean();
+          if (existing) {
+            return {
+              ok: true,
+              data: {
+                status: existing.status,
+                orderNumber: order.orderNumber,
+                reason: existing.reason,
+                nextStep:
+                  "A return request already exists for this order. Our care team will follow up, or email care@aadiora.com.",
+                order: summarizeOrder(order),
+              },
+              stageHint: "starting_return",
+            };
+          }
+          throw err;
+        }
+      }
+      case "get_cart": {
+        if (!ctx.userId) {
+          return authRequired("Please sign in to view your bag.");
+        }
+        let cart = await Cart.findOne({ userId: ctx.userId });
+        if (!cart) {
+          cart = await Cart.create({ userId: ctx.userId, items: [] });
+        }
+        await sanitizeCart(cart);
+        const items: Array<ProductCardPayload & { qty: number }> = [];
+        for (const item of cart.items) {
+          const saree = await Saree.findById(item.sareeId).lean();
+          if (!saree || !saree.isPublished) continue;
+          items.push({
+            id: saree._id.toString(),
+            slug: saree.slug,
+            name: saree.name,
+            price: saree.price,
+            qty: item.qty,
+            image: saree.images.gallery[0] || "",
+            inStock: saree.inventory > 0,
+            weave: saree.weave,
+            sku: saree.sku,
+          });
+        }
+        const subtotal = items.reduce((sum, i) => sum + i.price * i.qty, 0);
+        return {
+          ok: true,
+          data: { itemCount: items.length, subtotal, items, cartPath: "/cart" },
+          products: items.map(({ qty: _qty, ...card }) => card),
+          stageHint: "checking_cart",
+        };
+      }
+      case "add_to_cart": {
+        if (!ctx.userId) {
+          return authRequired("Please sign in to add pieces to your bag.");
+        }
+        const parsed = addToCartSchema.parse(args);
+        const qty = parsed.qty ?? 1;
+        const product = await getCatalogProduct(parsed.slugOrId);
+        if (!product) {
+          return { ok: false, data: { error: "Product not found" }, stageHint: "checking_cart" };
+        }
+        if (!product.inStock) {
+          return {
+            ok: false,
+            data: { error: "out_of_stock", message: `${product.name} is currently unavailable.` },
+            products: [product],
+            stageHint: "checking_cart",
+          };
+        }
+        if (!isValidObjectId(product.id)) {
+          return { ok: false, data: { error: "Invalid product id" }, stageHint: "checking_cart" };
+        }
+        const saree = await Saree.findById(product.id);
+        if (!saree || !saree.isPublished) {
+          return { ok: false, data: { error: "Product not found" }, stageHint: "checking_cart" };
+        }
+        let cart = await Cart.findOne({ userId: ctx.userId });
+        if (!cart) {
+          cart = await Cart.create({ userId: ctx.userId, items: [] });
+        }
+        await sanitizeCart(cart);
+        const existing = cart.items.find((i) => i.sareeId.toString() === product.id);
+        const newQty = existing ? existing.qty + qty : qty;
+        if (newQty > saree.inventory) {
+          return {
+            ok: false,
+            data: { error: "insufficient_inventory", message: `Only ${saree.inventory} in stock.` },
+            products: [product],
+            stageHint: "checking_cart",
+          };
+        }
+        if (existing) existing.qty = newQty;
+        else cart.items.push({ sareeId: saree._id, qty });
+        await cart.save();
+        return {
+          ok: true,
+          data: {
+            message: "Added to bag",
+            qty: newQty,
+            product,
+            cartPath: "/cart",
+          },
+          products: [product],
+          stageHint: "checking_cart",
+        };
+      }
+      case "get_my_profile": {
+        if (!ctx.userId) {
+          return authRequired("You are browsing as a guest. Sign in so I can greet you by name.");
         }
         const user = await User.findById(ctx.userId).select("name email").lean();
         if (!user) {
@@ -308,8 +596,8 @@ export async function executeTool(
               score: c.score,
             })),
           },
-          // Only treat as grounded knowledge when chunks actually returned.
           knowledgeUsed: chunks.length > 0,
+          stageHint: "searching_policies",
         };
       }
       default:

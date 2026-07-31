@@ -65,8 +65,13 @@ function formatOrderLine(o: {
   orderNumber: string;
   status: string;
   total: number;
+  items?: Array<{ name?: string; qty?: number }>;
 }): string {
-  return `• **${o.orderNumber}** — ${o.status.replace(/_/g, " ")} — ₹${Number(o.total).toLocaleString("en-IN")}`;
+  const itemHint =
+    o.items?.length && o.items[0]?.name
+      ? ` — ${o.items[0].name}${o.items.length > 1 ? ` +${o.items.length - 1}` : ""}`
+      : "";
+  return `• **${o.orderNumber}** — ${o.status.replace(/_/g, " ")} — ₹${Number(o.total).toLocaleString("en-IN")}${itemHint}`;
 }
 
 /**
@@ -112,6 +117,94 @@ export async function runMockChat(
           ? `Haan — aapka naam **${profile.name}** hai. Main aapki madad ke liye yahan hoon.`
           : `Yes — you're **${profile.name}**. How can I help you today?`,
       products: [],
+      handoff: false,
+    };
+  }
+
+  if (intent === "return_start") {
+    const result = await executeTool(
+      "start_return",
+      JSON.stringify({
+        ...(orderIdOrNumber ? { orderIdOrNumber } : {}),
+        reason: "Customer requested return via chat",
+      }),
+      ctx
+    );
+    const data = result.data as { message?: string; error?: string; orderNumber?: string; nextStep?: string };
+    if (!result.ok) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}${data.message ?? "Return shuru nahi ho paya. Sign in karein ya ORD-… number bhejein."}`
+            : `${prefix}${data.message ?? "I could not start a return. Sign in and share your ORD-… number if needed."}`,
+        products: [],
+        handoff: false,
+        needsSignIn: data.error === "auth_required",
+      };
+    }
+    return {
+      reply:
+        language === "hi"
+          ? `${prefix}Return request **${data.orderNumber}** ke liye register ho gaya. ${data.nextStep ?? ""}`
+          : `${prefix}Return request filed for **${data.orderNumber}**. ${data.nextStep ?? ""}`,
+      products: [],
+      handoff: false,
+    };
+  }
+
+  if (intent === "cart") {
+    const addCue = /\badd to (cart|bag)\b/i.test(message);
+    if (addCue) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}Kaunsi saree bag mein add karni hai? Product card par **Add to bag** dabayein, ya slug bataein.`
+            : `${prefix}Which saree should I add? Tap **Add to bag** on a product card, or tell me the product name/slug.`,
+        products: [],
+        handoff: false,
+      };
+    }
+    const result = await executeTool("get_cart", "{}", ctx);
+    const data = result.data as {
+      error?: string;
+      message?: string;
+      itemCount?: number;
+      subtotal?: number;
+      items?: Array<{ name: string; qty: number; price: number }>;
+    };
+    if (!result.ok) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}Bag dekhne ke liye please sign in karein (/login).`
+            : `${prefix}Please sign in to view your bag.`,
+        products: result.products ?? [],
+        handoff: false,
+        needsSignIn: true,
+      };
+    }
+    if (!data.itemCount) {
+      return {
+        reply:
+          language === "hi"
+            ? `${prefix}Aapka bag khali hai. Koi weave ya budget batayein — main pieces suggest karti hoon.`
+            : `${prefix}Your bag is empty. Tell me a weave or budget and I’ll suggest pieces — or browse /sarees.`,
+        products: [],
+        handoff: false,
+      };
+    }
+    const lines = (data.items ?? [])
+      .map(
+        (i) =>
+          `• **${i.name}** × ${i.qty} — ₹${Number(i.price).toLocaleString("en-IN")}`
+      )
+      .join("\n");
+    return {
+      reply:
+        language === "hi"
+          ? `${prefix}Aapke bag mein ${data.itemCount} item(s) hain (subtotal ₹${Number(data.subtotal).toLocaleString("en-IN")}):\n${lines}\n\nCheckout: /cart`
+          : `${prefix}Your bag has ${data.itemCount} item(s) (subtotal ₹${Number(data.subtotal).toLocaleString("en-IN")}):\n${lines}\n\nCheckout at /cart`,
+      products: (result.products ?? []).slice(0, 4),
       handoff: false,
     };
   }
